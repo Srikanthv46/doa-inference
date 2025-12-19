@@ -25,136 +25,241 @@ class InferenceConfig(BaseModel):
 
 
 # ==================== Complex-Valued Operations ====================
-class ComplexConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+class ComplexLinear(nn.Module):
+    """Complex-valued linear transformation"""
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.conv_r = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
-        self.conv_i = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
+        self.fc_real = nn.Linear(in_features, out_features, bias=bias)
+        self.fc_imag = nn.Linear(in_features, out_features, bias=bias)
     
     def forward(self, x):
-        real_out = self.conv_r(x.real) - self.conv_i(x.imag)
-        imag_out = self.conv_r(x.imag) + self.conv_i(x.real)
-        return torch.complex(real_out, imag_out)
+        real_part = self.fc_real(x.real) - self.fc_imag(x.imag)
+        imag_part = self.fc_real(x.imag) + self.fc_imag(x.real)
+        return torch.complex(real_part, imag_part)
+
+
+class ComplexLayerNorm(nn.Module):
+    """Complex-valued Layer Normalization"""
+    def __init__(self, normalized_shape, eps=1e-5):
+        super().__init__()
+        self.ln_real = nn.LayerNorm(normalized_shape, eps=eps)
+        self.ln_imag = nn.LayerNorm(normalized_shape, eps=eps)
+    
+    def forward(self, x):
+        real_normalized = self.ln_real(x.real)
+        imag_normalized = self.ln_imag(x.imag)
+        return torch.complex(real_normalized, imag_normalized)
 
 
 class ComplexBatchNorm1d(nn.Module):
+    """Complex-valued Batch Normalization for 1D data"""
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
-        self.bn_r = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
-        self.bn_i = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
+        self.bn_real = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
+        self.bn_imag = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
     
     def forward(self, x):
-        return torch.complex(self.bn_r(x.real), self.bn_i(x.imag))
+        real_normalized = self.bn_real(x.real)
+        imag_normalized = self.bn_imag(x.imag)
+        return torch.complex(real_normalized, imag_normalized)
+
+
+class ComplexConv1d(nn.Module):
+    """Complex-valued 1D Convolution"""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv_real = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv_imag = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
+    
+    def forward(self, x):
+        real_part = self.conv_real(x.real) - self.conv_imag(x.imag)
+        imag_part = self.conv_real(x.imag) + self.conv_imag(x.real)
+        return torch.complex(real_part, imag_part)
 
 
 class ComplexReLU(nn.Module):
+    """Complex ReLU: applies ReLU to both real and imaginary parts"""
     def forward(self, x):
         return torch.complex(F.relu(x.real), F.relu(x.imag))
 
 
-class ComplexLinear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        self.fc_r = nn.Linear(in_features, out_features)
-        self.fc_i = nn.Linear(in_features, out_features)
-    
-    def forward(self, x):
-        real_out = self.fc_r(x.real) - self.fc_i(x.imag)
-        imag_out = self.fc_r(x.imag) + self.fc_i(x.real)
-        return torch.complex(real_out, imag_out)
-
-
-class ComplexAdaptiveAvgPool1d(nn.Module):
-    def __init__(self, output_size):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool1d(output_size)
-    
-    def forward(self, x):
-        return torch.complex(self.pool(x.real), self.pool(x.imag))
-
-
-class ComplexSEBlock1d(nn.Module):
+class ComplexSEBlock(nn.Module):
+    """Complex-valued Squeeze-and-Excitation Block"""
     def __init__(self, channels, reduction=16):
         super().__init__()
-        self.pool = ComplexAdaptiveAvgPool1d(1)
-        self.fc1 = ComplexLinear(channels, channels // reduction)
-        self.fc2 = ComplexLinear(channels // reduction, channels)
+        self.fc1 = ComplexLinear(channels, channels // reduction, bias=False)
+        self.fc2 = ComplexLinear(channels // reduction, channels, bias=False)
         self.relu = ComplexReLU()
-        
+    
     def forward(self, x):
-        b, c, _ = x.size()
-        y = self.pool(x).view(b, c)
+        b, c, seq_len = x.size()
+        y = x.mean(dim=2)
         y = self.relu(self.fc1(y))
         y = self.fc2(y)
-        y_mag = torch.sqrt(y.real**2 + y.imag**2 + 1e-8)
-        y_mag = torch.sigmoid(y_mag)
-        y = torch.complex(y_mag * y.real, y_mag * y.imag)
-        return x * y.view(b, c, 1)
+        magnitude = torch.sqrt(y.real ** 2 + y.imag ** 2 + 1e-8)
+        phase = torch.atan2(y.imag, y.real)
+        weight = torch.sigmoid(magnitude)
+        y = weight * torch.complex(torch.cos(phase), torch.sin(phase))
+        return x * y.unsqueeze(-1)
+
+
+class ComplexMultiHeadAttention(nn.Module):
+    """Complex-valued Multi-Head Attention"""
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        self.q_proj = ComplexLinear(embed_dim, embed_dim)
+        self.k_proj = ComplexLinear(embed_dim, embed_dim)
+        self.v_proj = ComplexLinear(embed_dim, embed_dim)
+        self.out_proj = ComplexLinear(embed_dim, embed_dim)
+        
+        self.scale = self.head_dim ** -0.5
+    
+    def forward(self, x):
+        batch_size, seq_len, embed_dim = x.shape
+        
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        K_H = K.conj().transpose(-2, -1)
+        
+        attn_scores_real = torch.matmul(Q.real, K_H.real) - torch.matmul(Q.imag, K_H.imag)
+        attn_scores_imag = torch.matmul(Q.real, K_H.imag) + torch.matmul(Q.imag, K_H.real)
+        attn_scores = torch.complex(attn_scores_real, attn_scores_imag)
+        
+        attn_scores = attn_scores * self.scale
+        
+        attn_weights = torch.abs(attn_scores)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        output_real = torch.matmul(attn_weights, V.real)
+        output_imag = torch.matmul(attn_weights, V.imag)
+        output = torch.complex(output_real, output_imag)
+        
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        output = self.out_proj(output)
+        
+        return output
+
+
+class ComplexTransformerEncoderLayer(nn.Module):
+    """Complex-valued Transformer Encoder Layer"""
+    def __init__(self, d_model, nhead, dim_feedforward=2048):
+        super().__init__()
+        self.self_attn = ComplexMultiHeadAttention(d_model, nhead)
+        
+        self.linear1 = ComplexLinear(d_model, dim_feedforward)
+        self.linear2 = ComplexLinear(dim_feedforward, d_model)
+        
+        self.norm1 = ComplexLayerNorm(d_model)
+        self.norm2 = ComplexLayerNorm(d_model)
+        
+        self.activation = ComplexReLU()
+    
+    def forward(self, x):
+        attn_output = self.self_attn(x)
+        x = self.norm1(x + attn_output)
+        
+        ff_output = self.linear2(self.activation(self.linear1(x)))
+        x = self.norm2(x + ff_output)
+        
+        return x
 
 
 # ==================== Model Architecture ====================
 class ComplexCNNTransformer(nn.Module):
+    """Complex-Valued CNN-Transformer for DOA Estimation"""
     def __init__(self, in_channels=2, embed_dim=256, num_heads=8, ff_dim=512, 
                  num_layers=2, max_len=512):
         super().__init__()
         
+        # Complex CNN layers
         self.conv1 = ComplexConv1d(in_channels, 16, kernel_size=7, stride=2, padding=3)
         self.bn1 = ComplexBatchNorm1d(16)
+        
         self.conv2 = ComplexConv1d(16, 32, kernel_size=5, stride=2, padding=2)
         self.bn2 = ComplexBatchNorm1d(32)
+        
         self.conv3 = ComplexConv1d(32, 64, kernel_size=3, stride=2, padding=1)
         self.bn3 = ComplexBatchNorm1d(64)
+        
         self.conv4 = ComplexConv1d(64, 128, kernel_size=3, stride=2, padding=1)
         self.bn4 = ComplexBatchNorm1d(128)
+        
         self.conv5 = ComplexConv1d(128, 256, kernel_size=1, stride=2, padding=0)
         self.bn5 = ComplexBatchNorm1d(256)
-        self.se5 = ComplexSEBlock1d(256)
-        self.relu = ComplexReLU()
+        self.se5 = ComplexSEBlock(256)
         
-        self.complex_to_real_dim = 512
-        self.pos_embed = nn.Parameter(torch.randn(1, max_len, self.complex_to_real_dim))
-        self.norm = nn.LayerNorm(self.complex_to_real_dim)
+        self.activation = ComplexReLU()
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.complex_to_real_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Positional embedding
+        self.pos_embed_real = nn.Parameter(torch.randn(1, max_len, embed_dim))
+        self.pos_embed_imag = nn.Parameter(torch.randn(1, max_len, embed_dim))
+        self.norm = ComplexLayerNorm(embed_dim)
         
-        self.fc = nn.Sequential(
-            nn.Linear(self.complex_to_real_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-
+        # Complex Transformer Encoder
+        self.transformer_layers = nn.ModuleList([
+            ComplexTransformerEncoderLayer(embed_dim, num_heads, ff_dim)
+            for _ in range(num_layers)
+        ])
+        
+        # Output projection (complex to real)
+        self.fc_real = nn.Linear(embed_dim, 1)
+        
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        x = self.relu(self.bn3(self.conv3(x)))
-        x = self.relu(self.bn4(self.conv4(x)))
-        x = self.se5(self.relu(self.bn5(self.conv5(x))))
+        # CNN feature extraction
+        x = self.activation(self.bn1(self.conv1(x)))
+        x = self.activation(self.bn2(self.conv2(x)))
+        x = self.activation(self.bn3(self.conv3(x)))
+        x = self.activation(self.bn4(self.conv4(x)))
+        x = self.se5(self.activation(self.bn5(self.conv5(x))))
         
-        b, c, w = x.size()
-        x_real = torch.cat([x.real, x.imag], dim=1).permute(0, 2, 1)
+        # Reshape for transformer
+        x = x.transpose(1, 2)
         
-        seq_len = x_real.size(1)
-        x_real = x_real + self.pos_embed[:, :seq_len, :]
-        x_real = self.norm(x_real)
-        x_real = self.transformer(x_real).mean(dim=1)
+        # Add positional embedding
+        pos_embed = torch.complex(
+            self.pos_embed_real[:, :x.size(1), :], 
+            self.pos_embed_imag[:, :x.size(1), :]
+        )
+        x = x + pos_embed
+        x = self.norm(x)
         
-        return self.fc(x_real).squeeze(-1)
+        # Transformer encoder
+        for layer in self.transformer_layers:
+            x = layer(x)
+        
+        # Global average pooling
+        x = x.mean(dim=1)
+        
+        # Project to real output
+        x_magnitude = torch.sqrt(x.real ** 2 + x.imag ** 2)
+        output = torch.sigmoid(self.fc_real(x_magnitude)).squeeze(-1)
+        
+        return output
 
 
 # ==================== Inference Class ====================
 class DOAInference:
+    """
+    Direction of Arrival (DOA) Inference Class
+    
+    Loads a trained Complex-Valued CNN-Transformer model and performs inference
+    on single samples or batches of samples.
+    """
     
     def __init__(self, model_path: str, device: Optional[str] = None, batch_size: int = 32):
         """
-        Initialize the DOA model
+        Initialize the DOA inference class
         
         Args:
             model_path: Path to the trained model checkpoint (.pth file)
@@ -198,14 +303,13 @@ class DOAInference:
             # Print model info if available
             if 'best_rmse' in checkpoint:
                 print(f"✓ Model RMSE: {checkpoint['best_rmse']:.2f}°")
-            if 'epoch' in checkpoint:
-                print(f"✓ Trained epochs: {checkpoint['epoch'] + 1}")
+
             
             return model
             
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {str(e)}")
-
+    
     def _normalize_iq_minmax(self, complex_data: np.ndarray) -> np.ndarray:
         """
         Apply min-max normalization to I and Q components separately
@@ -234,16 +338,16 @@ class DOAInference:
         
         normalized_data = i_normalized + 1j * q_normalized
         return normalized_data
-        
+    
     def _preprocess(self, data: np.ndarray) -> torch.Tensor:
         """
-        Preprocess input data to complex tensor
+        Preprocess input data to complex tensor with normalization
         
         Args:
             data: Input array of shape (channels, samples) containing complex IQ data
             
         Returns:
-            Complex tensor ready for model input
+            Normalized complex tensor ready for model input
         """
         if data.dtype != np.complex64 and data.dtype != np.complex128:
             raise ValueError("Input data must be complex (IQ data)")
@@ -354,19 +458,26 @@ class DOAInference:
 # ==================== Example Usage ====================
 if __name__ == "__main__":
     # Initialize inference
-    doa_model = DOAInference(
-        model_path="cvnn_doa_best_model.pth",
+    inference = DOAInference(
+        model_path="doa_model.pth",
         device=None,
         batch_size=32
     )
     
-    sample_data = np.load("sample_data.npy")
+    sample_data = np.load("sample_data.npy") # IQ data shape (2 channels, 4096 samples)
+    sample_data = sample_data.astype(np.complex64) 
     
-    # Single sample inference
-    doa = doa_model.predict(sample_data)
-    print("Predicted DOA : ", doa)
+    # Streaming inference
+    doa = inference.predict(sample_data)
+    print(f"\nSingle prediction: {doa:.2f}°")
     
-    batch_data = [sample_data for i in range(16)]
-    doas = doa_model.batch_predict(batch_data)
-    print("Batch DOA Predictions : ", doas)
+    # Batch prediction
+    batch_data = [
+        sample_data
+        for _ in range(10)
+    ]
+    batch_data = [d.astype(np.complex64) for d in batch_data]
     
+    doas = inference.batch_predict(batch_data)
+    print(f"\nBatch predictions: {doas}")
+    print(f"Median DOA: {np.nanmedian(doas):.2f}°")
